@@ -65,10 +65,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.ReadWriteLock;
@@ -83,7 +80,6 @@ import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadF
 
 import org.elasticsearch.common.logging.ESLogger;
 import org.elasticsearch.common.logging.Loggers;
-import org.elasticsearch.common.settings.Settings;
 
 /**
  * There are 3 types of connections per node, low/med/high. Low if for batch oriented APIs (like recovery or
@@ -150,7 +146,8 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
 
     private volatile BoundTransportAddress boundAddress;
 
-    private final Object[] connectMutex;
+    private final ConcurrentHashMap<String, Object> connectionMutexes = new ConcurrentHashMap<String, Object>();
+
     // this lock is here to make sure we close this transport and disconnect all the client nodes
     // connections while no connect operations is going on... (this might help with 100% CPU when stopping the transport?)
     private final ReadWriteLock globalLock = new ReentrantReadWriteLock();
@@ -171,11 +168,6 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
 
         if (settings.getAsBoolean("netty.epollBugWorkaround", false)) {
             System.setProperty("org.jboss.netty.epollBugWorkaround", "true");
-        }
-
-        this.connectMutex = new Object[500];
-        for (int i = 0; i < connectMutex.length; i++) {
-            connectMutex[i] = new Object();
         }
 
         this.workerCount = componentSettings.getAsInt("worker_count", Runtime.getRuntime().availableProcessors() * 2);
@@ -791,14 +783,15 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
     }
 
     private Object connectLock(String nodeId) {
-        int hash = nodeId.hashCode();
-        // abs returns Integer.MIN_VALUE, so we need to protect against it...
-        if (hash == Integer.MIN_VALUE) {
-            hash = 0;
+        Object lock = connectionMutexes.get(nodeId);
+        if (lock == null) {
+            lock = new Object();
+            Object res = connectionMutexes.putIfAbsent(nodeId, lock);
+            if (res != null)
+                lock = res;
         }
-        int index = Math.abs(hash) % connectMutex.length;
-        logger.debug("Returning connection lock at index {} for nodeId {}", index, nodeId);
-        return connectMutex[index];
+        logger.debug("Returning lock {} for nodeId {}", System.identityHashCode(lock), nodeId);
+        return lock;
     }
 
     private class ChannelCloseListener implements ChannelFutureListener {
