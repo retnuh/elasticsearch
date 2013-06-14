@@ -81,6 +81,10 @@ import static org.elasticsearch.common.transport.NetworkExceptionHelper.isConnec
 import static org.elasticsearch.common.util.concurrent.ConcurrentCollections.newConcurrentMap;
 import static org.elasticsearch.common.util.concurrent.EsExecutors.daemonThreadFactory;
 
+import org.elasticsearch.common.logging.ESLogger;
+import org.elasticsearch.common.logging.Loggers;
+import org.elasticsearch.common.settings.Settings;
+
 /**
  * There are 3 types of connections per node, low/med/high. Low if for batch oriented APIs (like recovery or
  * batch) with high payload that will cause regular request. (like search or single index) to take
@@ -714,14 +718,14 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                 }
             }
         } catch (RuntimeException e) {
-            // clean the futures
+            logger.warn("Unexpected exception caught while connecting to channels: ", e);
             for (ChannelFuture future : ImmutableList.<ChannelFuture>builder().add(connectLow).add(connectMed).add(connectHigh).build()) {
                 future.cancel();
                 if (future.getChannel() != null && future.getChannel().isOpen()) {
                     try {
                         future.getChannel().close();
                     } catch (Exception e1) {
-                        // ignore
+                        logger.warn("Unknown error caught while closing channels after handling runtime ex {}, ignoring: ", e.getMessage(), e1);
                     }
                 }
             }
@@ -729,18 +733,24 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
         }
     }
 
+    private void closeNodeChannels(DiscoveryNode node, NodeChannels nodeChannels, String reason) {
+        if (nodeChannels != null) {
+            try {
+                nodeChannels.close();
+            } catch (Exception e) {
+                logger.warn("Unexpected exception caught while disconnecting from node for reason {}, ignoring: ", reason, e);
+            } finally {
+                logger.debug("disconnected from [{}], {}",reason, node);
+                transportServiceAdapter.raiseNodeDisconnected(node);
+            }
+        }
+    }
+
     @Override
     public void disconnectFromNode(DiscoveryNode node) {
         synchronized (connectLock(node.id())) {
             NodeChannels nodeChannels = connectedNodes.remove(node);
-            if (nodeChannels != null) {
-                try {
-                    nodeChannels.close();
-                } finally {
-                    logger.debug("disconnected from [{}]", node);
-                    transportServiceAdapter.raiseNodeDisconnected(node);
-                }
-            }
+            closeNodeChannels(node, nodeChannels, "disconnect");
         }
     }
 
@@ -752,12 +762,7 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
             NodeChannels nodeChannels = connectedNodes.get(node);
             if (nodeChannels != null && nodeChannels.hasChannel(channel)) {
                 connectedNodes.remove(node);
-                try {
-                    nodeChannels.close();
-                } finally {
-                    logger.debug("disconnected from [{}], {}", node, reason);
-                    transportServiceAdapter.raiseNodeDisconnected(node);
-                }
+                closeNodeChannels(node, nodeChannels, reason);
             }
         }
     }
@@ -771,12 +776,7 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                 NodeChannels nodeChannels = connectedNodes.get(node);
                 if (nodeChannels != null && nodeChannels.hasChannel(channel)) {
                     connectedNodes.remove(node);
-                    try {
-                        nodeChannels.close();
-                    } finally {
-                        logger.debug("disconnected from [{}] on channel failure", failure, node);
-                        transportServiceAdapter.raiseNodeDisconnected(node);
-                    }
+                    closeNodeChannels(node, nodeChannels, "channel failure (" + failure.getMessage()+")");
                 }
             }
         }
@@ -796,7 +796,9 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
         if (hash == Integer.MIN_VALUE) {
             hash = 0;
         }
-        return connectMutex[Math.abs(hash) % connectMutex.length];
+        int index = Math.abs(hash) % connectMutex.length;
+        logger.debug("Returning connection lock at index {} for nodeId {}", index, nodeId);
+        return connectMutex[index];
     }
 
     private class ChannelCloseListener implements ChannelFutureListener {
@@ -814,6 +816,8 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
     }
 
     public static class NodeChannels {
+
+        protected static final ESLogger logger = Loggers.getLogger(NodeChannels.class);
 
         private Channel[] low;
         private final AtomicInteger lowCounter = new AtomicInteger();
@@ -857,7 +861,11 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
             closeChannelsAndWait(med, futures);
             closeChannelsAndWait(high, futures);
             for (ChannelFuture future : futures) {
-                future.awaitUninterruptibly();
+                try {
+                    future.awaitUninterruptibly();
+                } catch (Exception e) {
+                    logger.warn("Unexpected exception trying to close nodeChannels, ignoring: ", e);
+                }
             }
         }
 
@@ -868,7 +876,7 @@ public class NettyTransport extends AbstractLifecycleComponent<Transport> implem
                         futures.add(channel.close());
                     }
                 } catch (Exception e) {
-                    //ignore
+                    logger.warn("Exception caught trying to close channel {}, ignoring:", channel, e);
                 }
             }
         }
